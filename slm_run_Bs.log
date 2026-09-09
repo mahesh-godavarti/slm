@@ -1,0 +1,30 @@
+Vocab: 65 | Train: 1,003,854 | Val: 111,540
+Device: cuda | n_embed=128 n_layers=4 n_heads=4
+Train ctx=256 | Eval lengths: [256, 512, 1024, 2048, 4096]
+
+============================================================
+Model Bs
+============================================================
+Params: 810,049
+/home/ubuntu/experiments/venv/lib/python3.12/site-packages/torch/cuda/__init__.py:734: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+[Bs] iter     1 | loss 4.3581 | val_ppl 65.22
+[Bs] iter   500 | loss 2.0707 | val_ppl 7.95
+[Bs] iter  1000 | loss 1.8098 | val_ppl 6.50
+[Bs] iter  1500 | loss 1.6956 | val_ppl 5.97
+[Bs] iter  2000 | loss 1.6231 | val_ppl 5.60
+[Bs] iter  2500 | loss 1.5955 | val_ppl 5.40
+[Bs] iter  3000 | loss 1.5751 | val_ppl 5.38
+[Bs] iter  3500 | loss 1.5331 | val_ppl 5.24
+[Bs] iter  4000 | loss 1.5287 | val_ppl 5.24
+[Bs] iter  4500 | loss 1.5315 | val_ppl 5.23
+[Bs] iter  5000 | loss 1.5157 | val_ppl 5.21
+Time: 310.7s
+
+Eval PPL by context length:
+  ctx=  256  PPL=5.18
+  ctx=  512  PPL=5.63
+  ctx= 1024  PPL=7.77
+  ctx= 2048  PPL=10.51
+  ctx= 4096  PPL=12.70
+

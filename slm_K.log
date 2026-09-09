@@ -1,0 +1,30 @@
+Vocab: 65 | Train: 1,003,854 | Val: 111,540
+Device: cuda | n_embed=128 n_layers=4 n_heads=4
+Train ctx=256 | Eval lengths: [256, 512, 1024, 2048, 4096]
+
+============================================================
+Model K
+============================================================
+Params: 844,097
+/home/ubuntu/experiments/venv/lib/python3.12/site-packages/torch/cuda/__init__.py:734: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+[K] iter     1 | loss 4.3320 | val_ppl 64.43
+[K] iter   500 | loss 2.3859 | val_ppl 11.16
+[K] iter  1000 | loss 2.3109 | val_ppl 10.48
+[K] iter  1500 | loss 2.1310 | val_ppl 8.54
+[K] iter  2000 | loss 2.0181 | val_ppl 7.41
+[K] iter  2500 | loss 1.8890 | val_ppl 7.02
+[K] iter  3000 | loss 1.8653 | val_ppl 6.66
+[K] iter  3500 | loss 1.8024 | val_ppl 6.48
+[K] iter  4000 | loss 1.7763 | val_ppl 6.43
+[K] iter  4500 | loss 1.7771 | val_ppl 6.41
+[K] iter  5000 | loss 1.7745 | val_ppl 6.41
+Time: 351.6s
+
+Eval PPL by context length:
+  ctx=  256  PPL=6.45
+  ctx=  512  PPL=8.12
+  ctx= 1024  PPL=12.50
+  ctx= 2048  PPL=16.65
+  ctx= 4096  PPL=19.20
+
