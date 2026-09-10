@@ -130,8 +130,9 @@ class AddressedAttention(nn.Module):
     """Attention with causal content addressing.
 
     Same-line pairs: Q and K rotated by reset-RoPE only (pure positional).
-    Cross-line pairs: K additionally rotated by line content offset.
-    This ensures no position's output depends on future tokens in its line.
+    Cross-line pairs: Q rotated by prefix address (line so far),
+                      K rotated by full-line address.
+    Two-sided content matching without leaking future tokens.
     """
 
     def __init__(self, n_embed, n_heads, dropout=0.1):
@@ -145,7 +146,7 @@ class AddressedAttention(nn.Module):
         self.out_proj = nn.Linear(n_embed, n_embed)
         self.attn_drop = dropout
 
-    def forward(self, x, rope, offset, line_ids):
+    def forward(self, x, rope, offset, prefix_offset, line_ids):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
@@ -154,14 +155,16 @@ class AddressedAttention(nn.Module):
         # Split angles across heads: (B, T, C//2) -> (B, H, T, D//2)
         r = rope.view(B, T, H, D // 2).transpose(1, 2)
         o = offset.view(B, T, H, D // 2).transpose(1, 2)
+        po = prefix_offset.view(B, T, H, D // 2).transpose(1, 2)
         # Plain: Q and K rotated by reset-RoPE only
         q_rot = apply_rotation(q, r)
         k_plain = apply_rotation(k, r)
-        # Addressed: K additionally rotated by offset (R(a+b) = R(b) . R(a))
+        # Addressed: Q by prefix address, K by full-line address
+        q_addr = apply_rotation(q_rot, po)
         k_addr = apply_rotation(k_plain, o)
         scale = 1.0 / math.sqrt(D)
         plain_scores = (q_rot @ k_plain.transpose(-2, -1)) * scale
-        addr_scores = (q_rot @ k_addr.transpose(-2, -1)) * scale
+        addr_scores = (q_addr @ k_addr.transpose(-2, -1)) * scale
         # Same-line mask: True where query and key are in the same line
         same_line = (line_ids.unsqueeze(2) == line_ids.unsqueeze(1))  # (B, T, T)
         scores = torch.where(same_line.unsqueeze(1), plain_scores, addr_scores)
@@ -183,8 +186,8 @@ class AddressedBlock(nn.Module):
         self.ln2 = nn.LayerNorm(n_embed)
         self.ffn = FeedForward(n_embed, dropout)
 
-    def forward(self, x, rope, offset, line_ids):
-        x = x + self.attn(self.ln1(x), rope, offset, line_ids)
+    def forward(self, x, rope, offset, prefix_offset, line_ids):
+        x = x + self.attn(self.ln1(x), rope, offset, prefix_offset, line_ids)
         x = x + self.ffn(self.ln2(x))
         return x
 
@@ -353,27 +356,31 @@ class ModelJ(nn.Module):
     - RoPE position resets to 0 at each newline boundary
     - Each completed line gets a content-based angle offset: rotate
       embeddings by RoPE, scatter-add per line, mean-pool, LN → Linear.
-    - Causality: offset is applied only to K for cross-line attention.
-      Same-line pairs use pure reset-RoPE. No position's output depends
-      on future tokens within its own line.
+    - Q gets prefix address (cumulative mean of line so far), K gets
+      full-line address. Two-sided content matching, causal by construction.
+    - Same-line pairs use pure reset-RoPE.
+    - random_addresses=True: replaces content addresses with i.i.d. random
+      per-line draws (control ablation, formerly ModelJr).
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, n_heads, newline_id,
-                 dropout=0.1):
+                 dropout=0.1, random_addresses=False):
         super().__init__()
         self.newline_id = newline_id
         self.n_embed = n_embed
+        self.random_addresses = random_addresses
         self.token_emb = nn.Embedding(vocab_size, n_embed)
         self.register_buffer('base_freq', make_base_freq(n_embed))
-        self.line_ln = nn.LayerNorm(n_embed)
-        self.line_proj = nn.Linear(n_embed, n_embed // 2)
+        if not random_addresses:
+            self.line_ln = nn.LayerNorm(n_embed)
+            self.line_proj = nn.Linear(n_embed, n_embed // 2)
         self.blocks = nn.ModuleList(
             [AddressedBlock(n_embed, n_heads, dropout) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def _line_info(self, idx):
-        """Compute line_ids and pos_in_line from newline positions.
+        """Compute line_ids, pos_in_line, and line_start from newline positions.
 
         Newline is the LAST character of a line; the character after it
         starts a new line with position 0.
@@ -389,93 +396,52 @@ class ModelJ(nn.Module):
         marker = torch.where(starts, gpos, torch.zeros_like(gpos))
         line_start, _ = marker.cummax(dim=1)
         pos_in_line = (gpos - line_start).float()
-        return line_ids, pos_in_line
+        return line_ids, pos_in_line, line_start
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
         device = idx.device
         x = self.token_emb(idx)
-        line_ids, pos_in_line = self._line_info(idx)
+        line_ids, pos_in_line, line_start = self._line_info(idx)
 
         # RoPE with per-line position reset
         rope = pos_in_line.unsqueeze(-1) * self.base_freq  # (B, T, C//2)
 
-        # Content-based line angle offset (full-line mean)
-        rotated = apply_rotation(x, rope)  # (B, T, C)
-        n_lines = line_ids.max().item() + 1
-        lid_exp = line_ids.unsqueeze(-1).expand(-1, -1, self.n_embed)
-        sums = torch.zeros(B, n_lines, self.n_embed, device=device)
-        sums.scatter_add_(1, lid_exp, rotated)
-        counts = torch.zeros(B, n_lines, 1, device=device)
-        counts.scatter_add_(1, line_ids.unsqueeze(-1),
-                            torch.ones(B, T, 1, device=device))
-        pooled = sums / counts.clamp(min=1)  # (B, n_lines, C)
-        line_angles = self.line_proj(self.line_ln(pooled))  # (B, n_lines, C//2)
-        offset = line_angles.gather(
-            1, line_ids.unsqueeze(-1).expand(-1, -1, self.n_embed // 2))
+        half = self.n_embed // 2
+        if self.random_addresses:
+            # Random i.i.d. offset per line (control ablation)
+            n_lines = line_ids.max().item() + 1
+            line_angles = torch.randn(B, n_lines, half, device=device)
+            offset = line_angles.gather(
+                1, line_ids.unsqueeze(-1).expand(-1, -1, half))
+            prefix_offset = offset  # random has no prefix concept
+        else:
+            # Content-based line angle offset (full-line mean for K)
+            rotated = apply_rotation(x, rope)  # (B, T, C)
+            n_lines = line_ids.max().item() + 1
+            lid_exp = line_ids.unsqueeze(-1).expand(-1, -1, self.n_embed)
+            sums = torch.zeros(B, n_lines, self.n_embed, device=device)
+            sums.scatter_add_(1, lid_exp, rotated)
+            counts = torch.zeros(B, n_lines, 1, device=device)
+            counts.scatter_add_(1, line_ids.unsqueeze(-1),
+                                torch.ones(B, T, 1, device=device))
+            pooled = sums / counts.clamp(min=1)  # (B, n_lines, C)
+            line_angles = self.line_proj(self.line_ln(pooled))
+            offset = line_angles.gather(
+                1, line_ids.unsqueeze(-1).expand(-1, -1, half))
+
+            # Prefix address (segmented cumulative mean for Q)
+            cumsum_full = torch.cumsum(rotated, dim=1)  # (B, T, C)
+            ls_prev = (line_start - 1).clamp(min=0)
+            boundary = cumsum_full.gather(
+                1, ls_prev.unsqueeze(-1).expand(-1, -1, self.n_embed))
+            boundary = boundary * (line_start > 0).unsqueeze(-1).float()
+            seg_cumsum = cumsum_full - boundary  # per-line cumsum
+            prefix_mean = seg_cumsum / (pos_in_line + 1).unsqueeze(-1)
+            prefix_offset = self.line_proj(self.line_ln(prefix_mean))
 
         for block in self.blocks:
-            x = block(x, rope, offset, line_ids)
-        logits = self.lm_head(self.ln_f(x))
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
-
-
-# ============================================================================
-# Model Jr: RoPE reset + random i.i.d. line offsets
-# ============================================================================
-
-class ModelJr(nn.Module):
-    """RoPE reset at newlines + random i.i.d. angle offset per line.
-    No content-based addressing — each line gets a fresh random offset
-    each forward pass. Tests whether any distinct per-line signal suffices."""
-
-    def __init__(self, vocab_size, n_embed, n_layers, n_heads, newline_id,
-                 dropout=0.1):
-        super().__init__()
-        self.newline_id = newline_id
-        self.n_embed = n_embed
-        self.token_emb = nn.Embedding(vocab_size, n_embed)
-        self.register_buffer('base_freq', make_base_freq(n_embed))
-        self.blocks = nn.ModuleList(
-            [Block(n_embed, n_heads, dropout) for _ in range(n_layers)])
-        self.ln_f = nn.LayerNorm(n_embed)
-        self.lm_head = nn.Linear(n_embed, vocab_size)
-
-    def _line_info(self, idx):
-        B, T = idx.shape
-        device = idx.device
-        is_nl = (idx == self.newline_id)
-        starts = torch.zeros(B, T, dtype=torch.bool, device=device)
-        starts[:, 0] = True
-        starts[:, 1:] = is_nl[:, :-1]
-        line_ids = starts.long().cumsum(dim=1) - 1
-        gpos = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-        marker = torch.where(starts, gpos, torch.zeros_like(gpos))
-        line_start, _ = marker.cummax(dim=1)
-        pos_in_line = (gpos - line_start).float()
-        return line_ids, pos_in_line
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        device = idx.device
-        x = self.token_emb(idx)
-        line_ids, pos_in_line = self._line_info(idx)
-        rope = pos_in_line.unsqueeze(-1) * self.base_freq
-
-        # Random i.i.d. offset per line
-        n_lines = line_ids.max().item() + 1
-        line_angles = torch.randn(B, n_lines, self.n_embed // 2, device=device)
-        offset = line_angles.gather(
-            1, line_ids.unsqueeze(-1).expand(-1, -1, self.n_embed // 2))
-        max_line = line_ids.max(dim=1, keepdim=True).values
-        offset = offset * (line_ids != max_line).unsqueeze(-1).float()
-
-        angles = rope + offset
-        for block in self.blocks:
-            x = block(x, angles)
+            x = block(x, rope, offset, prefix_offset, line_ids)
         logits = self.lm_head(self.ln_f(x))
         loss = None
         if targets is not None:
@@ -518,24 +484,36 @@ class ModelJc(nn.Module):
         marker = torch.where(starts, gpos, torch.zeros_like(gpos))
         line_start, _ = marker.cummax(dim=1)
         pos_in_line = (gpos - line_start).float()
-        return line_ids, pos_in_line
+        return line_ids, pos_in_line, line_start
 
-    def _compute_offset(self, x, rope, line_ids, lid_exp, lid_exp_half, counts):
-        """Compute per-position line offset from current residual stream."""
+    def _compute_offsets(self, x, rope, line_ids, lid_exp, lid_exp_half,
+                         counts, line_start, pos_in_line):
+        """Compute full-line offset (for K) and prefix offset (for Q)."""
         rotated = apply_rotation(x, rope)
         B = x.shape[0]
         n_lines = counts.shape[1]
+        # Full-line mean (for K)
         sums = torch.zeros(B, n_lines, self.n_embed, device=x.device)
         sums.scatter_add_(1, lid_exp, rotated)
         pooled = sums / counts
         line_angles = self.line_proj(self.line_ln(pooled))
-        return line_angles.gather(1, lid_exp_half)
+        offset = line_angles.gather(1, lid_exp_half)
+        # Prefix mean (for Q)
+        cumsum_full = torch.cumsum(rotated, dim=1)
+        ls_prev = (line_start - 1).clamp(min=0)
+        boundary = cumsum_full.gather(
+            1, ls_prev.unsqueeze(-1).expand(-1, -1, self.n_embed))
+        boundary = boundary * (line_start > 0).unsqueeze(-1).float()
+        seg_cumsum = cumsum_full - boundary
+        prefix_mean = seg_cumsum / (pos_in_line + 1).unsqueeze(-1)
+        prefix_offset = self.line_proj(self.line_ln(prefix_mean))
+        return offset, prefix_offset
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
         device = idx.device
         x = self.token_emb(idx)
-        line_ids, pos_in_line = self._line_info(idx)
+        line_ids, pos_in_line, line_start = self._line_info(idx)
         rope = pos_in_line.unsqueeze(-1) * self.base_freq
 
         # Precompute reusable index tensors
@@ -548,9 +526,10 @@ class ModelJc(nn.Module):
         counts = counts.clamp(min=1)
 
         for block in self.blocks:
-            offset = self._compute_offset(x, rope, line_ids, lid_exp,
-                                          lid_exp_half, counts)
-            x = block(x, rope, offset, line_ids)
+            offset, prefix_offset = self._compute_offsets(
+                x, rope, line_ids, lid_exp, lid_exp_half, counts,
+                line_start, pos_in_line)
+            x = block(x, rope, offset, prefix_offset, line_ids)
 
         logits = self.lm_head(self.ln_f(x))
         loss = None
@@ -762,8 +741,9 @@ def main():
             model = ModelJ(vocab_size, args.n_embed, args.n_layers,
                            args.n_heads, newline_id, args.dropout)
         elif name == 'Jr':
-            model = ModelJr(vocab_size, args.n_embed, args.n_layers,
-                            args.n_heads, newline_id, args.dropout)
+            model = ModelJ(vocab_size, args.n_embed, args.n_layers,
+                           args.n_heads, newline_id, args.dropout,
+                           random_addresses=True)
         elif name == 'Jc':
             model = ModelJc(vocab_size, args.n_embed, args.n_layers,
                             args.n_heads, newline_id, args.dropout)

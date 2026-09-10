@@ -9,7 +9,7 @@ import os
 import sys
 import torch
 from slm import (load_data, ModelB, ModelBa, ModelBs,
-                 ModelJ, ModelJc, ModelJr, ModelK)
+                 ModelJ, ModelJc, ModelK)
 
 
 def test_causality(model, x, edit_pos, new_token, name):
