@@ -7,28 +7,31 @@ Character-level language models comparing positional encoding strategies for len
 | Model | Description |
 |-------|-------------|
 | **B** | Standard RoPE — continuous positions 0..T-1 |
-| **Ba** | ALiBi — additive linear bias, no rotation |
-| **Bs** | RoPE with newline reset (no content offset) |
-| **J** | LISformer — RoPE resets at newlines + content-based line addressing (Q: prefix address, K: full-line address) |
-| **Jc** | Per-layer LISformer — recomputes offsets per layer from residual stream |
-| **Jr** | J with random i.i.d. line addresses instead of content-derived (ablation control) |
-| **K** | Purely content-derived angles (no positional info) |
+| **J** | LISformer — RoPE resets at newlines + two-score attention with content-based K addressing |
+| **Jr** | J with random i.i.d. K line addresses instead of content-derived (ablation control) |
 
 ## Key result
 
 | Model | ctx=256 | ctx=512 | ctx=1024 | ctx=2048 | ctx=4096 |
 |-------|---------|---------|----------|----------|----------|
 | B (RoPE)          | 4.71 | 5.78 | 7.56 | 9.62 | 12.09 |
-| J (reset+content) | 5.07 | 5.01 | 5.05 | 5.09 | 5.24  |
-| Jr (reset+random) | 4.88 | 4.87 | 4.92 | 4.95 | 5.09  |
+| J (reset+content) | 4.90 | 4.86 | 4.93 | 5.01 | 5.27  |
+| Jr (reset+random) | 4.90 | 4.91 | 4.98 | 5.05 | 5.25  |
 
 (Trained at ctx=256, n_embed=128, n_layers=4, 5K iters on Shakespeare.)
 
-J generalizes to 16x training context (5.07 → 5.24) while B degrades sharply (4.71 → 12.09).
+J generalizes to 16x training context (4.90 → 5.27) while B degrades sharply (4.71 → 12.09). Jr matches J closely, showing the length generalization comes from the structural reset + two-score routing, not the content signal.
 
-## Causality
+## Two-score attention
 
-Cross-line attention uses two-sided content matching: Q carries a prefix address (cumulative mean of its line so far), K carries the full-line address. Same-line pairs use pure reset-RoPE. At line completion, the prefix address equals the full-line address — the address crystallizes. Run `python causality_test.py` to verify all models pass (exact 0.0 delta).
+Cross-line attention uses two scores selected by a same-line mask:
+
+- **Same-line pairs** → plain scores: Q and K rotated by reset-RoPE only (within-line positional matching)
+- **Cross-line pairs** → addressed scores: K additionally rotated by its line's content address, Q has no address (zero offset)
+
+K's line address is computed from input embeddings: rotate by reset-RoPE, scatter-add per line, mean-pool, LayerNorm → Linear. Q receives no address rotation — cross-line matching is purely K-sided.
+
+This is fully causal: K addresses summarize completed past lines, Q uses only reset-RoPE positions. Run `python causality_test.py` to verify (exact 0.0 delta).
 
 ## Usage
 

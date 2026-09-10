@@ -414,7 +414,7 @@ class ModelJ(nn.Module):
             line_angles = torch.randn(B, n_lines, half, device=device)
             offset = line_angles.gather(
                 1, line_ids.unsqueeze(-1).expand(-1, -1, half))
-            prefix_offset = offset  # random has no prefix concept
+            prefix_offset = torch.zeros(B, T, half, device=device)
         else:
             # Content-based line angle offset (full-line mean for K)
             rotated = apply_rotation(x, rope)  # (B, T, C)
@@ -430,15 +430,8 @@ class ModelJ(nn.Module):
             offset = line_angles.gather(
                 1, line_ids.unsqueeze(-1).expand(-1, -1, half))
 
-            # Prefix address (segmented cumulative mean for Q)
-            cumsum_full = torch.cumsum(rotated, dim=1)  # (B, T, C)
-            ls_prev = (line_start - 1).clamp(min=0)
-            boundary = cumsum_full.gather(
-                1, ls_prev.unsqueeze(-1).expand(-1, -1, self.n_embed))
-            boundary = boundary * (line_start > 0).unsqueeze(-1).float()
-            seg_cumsum = cumsum_full - boundary  # per-line cumsum
-            prefix_mean = seg_cumsum / (pos_in_line + 1).unsqueeze(-1)
-            prefix_offset = self.line_proj(self.line_ln(prefix_mean))
+            # Q offset = zero (no prefix address)
+            prefix_offset = torch.zeros(B, T, half, device=device)
 
         for block in self.blocks:
             x = block(x, rope, offset, prefix_offset, line_ids)
