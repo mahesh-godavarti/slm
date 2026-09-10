@@ -123,6 +123,73 @@ class Block(nn.Module):
 
 
 # ============================================================================
+# Addressed Attention (causal content addressing for LISformer)
+# ============================================================================
+
+class AddressedAttention(nn.Module):
+    """Attention with causal content addressing.
+
+    Same-line pairs: Q and K rotated by reset-RoPE only (pure positional).
+    Cross-line pairs: K additionally rotated by line content offset.
+    This ensures no position's output depends on future tokens in its line.
+    """
+
+    def __init__(self, n_embed, n_heads, dropout=0.1):
+        super().__init__()
+        assert n_embed % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = n_embed // n_heads
+        self.q_proj = nn.Linear(n_embed, n_embed)
+        self.k_proj = nn.Linear(n_embed, n_embed)
+        self.v_proj = nn.Linear(n_embed, n_embed)
+        self.out_proj = nn.Linear(n_embed, n_embed)
+        self.attn_drop = dropout
+
+    def forward(self, x, rope, offset, line_ids):
+        B, T, C = x.shape
+        H, D = self.n_heads, self.head_dim
+        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
+        # Split angles across heads: (B, T, C//2) -> (B, H, T, D//2)
+        r = rope.view(B, T, H, D // 2).transpose(1, 2)
+        o = offset.view(B, T, H, D // 2).transpose(1, 2)
+        # Plain: Q and K rotated by reset-RoPE only
+        q_rot = apply_rotation(q, r)
+        k_plain = apply_rotation(k, r)
+        # Addressed: K additionally rotated by offset (R(a+b) = R(b) . R(a))
+        k_addr = apply_rotation(k_plain, o)
+        scale = 1.0 / math.sqrt(D)
+        plain_scores = (q_rot @ k_plain.transpose(-2, -1)) * scale
+        addr_scores = (q_rot @ k_addr.transpose(-2, -1)) * scale
+        # Same-line mask: True where query and key are in the same line
+        same_line = (line_ids.unsqueeze(2) == line_ids.unsqueeze(1))  # (B, T, T)
+        scores = torch.where(same_line.unsqueeze(1), plain_scores, addr_scores)
+        # Causal mask
+        causal = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
+        scores = scores.masked_fill(~causal, float('-inf'))
+        attn = F.softmax(scores, dim=-1)
+        if self.training and self.attn_drop > 0:
+            attn = F.dropout(attn, p=self.attn_drop)
+        out = attn @ v
+        return self.out_proj(out.transpose(1, 2).contiguous().view(B, T, C))
+
+
+class AddressedBlock(nn.Module):
+    def __init__(self, n_embed, n_heads, dropout=0.1):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.attn = AddressedAttention(n_embed, n_heads, dropout)
+        self.ln2 = nn.LayerNorm(n_embed)
+        self.ffn = FeedForward(n_embed, dropout)
+
+    def forward(self, x, rope, offset, line_ids):
+        x = x + self.attn(self.ln1(x), rope, offset, line_ids)
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+
+# ============================================================================
 # ALiBi Attention
 # ============================================================================
 
@@ -284,9 +351,11 @@ class ModelJ(nn.Module):
     """Char-level transformer with line-aware positional encoding.
 
     - RoPE position resets to 0 at each newline boundary
-    - Each line gets a content-based angle offset: rotate embeddings by
-      their RoPE angle (the operator), scatter-add per line, mean-pool,
-      LayerNorm -> Linear -> angle offset
+    - Each completed line gets a content-based angle offset: rotate
+      embeddings by RoPE, scatter-add per line, mean-pool, LN → Linear.
+    - Causality: offset is applied only to K for cross-line attention.
+      Same-line pairs use pure reset-RoPE. No position's output depends
+      on future tokens within its own line.
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, n_heads, newline_id,
@@ -296,11 +365,10 @@ class ModelJ(nn.Module):
         self.n_embed = n_embed
         self.token_emb = nn.Embedding(vocab_size, n_embed)
         self.register_buffer('base_freq', make_base_freq(n_embed))
-        # Content-based line angle: scatter-add -> LN -> Linear -> angle
         self.line_ln = nn.LayerNorm(n_embed)
         self.line_proj = nn.Linear(n_embed, n_embed // 2)
         self.blocks = nn.ModuleList(
-            [Block(n_embed, n_heads, dropout) for _ in range(n_layers)])
+            [AddressedBlock(n_embed, n_heads, dropout) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
@@ -309,21 +377,14 @@ class ModelJ(nn.Module):
 
         Newline is the LAST character of a line; the character after it
         starts a new line with position 0.
-
-        Returns:
-            line_ids: (B, T) long, 0-indexed line number
-            pos_in_line: (B, T) float, position within current line
         """
         B, T = idx.shape
         device = idx.device
         is_nl = (idx == self.newline_id)
-        # A new line starts at position 0 and after every newline
         starts = torch.zeros(B, T, dtype=torch.bool, device=device)
         starts[:, 0] = True
         starts[:, 1:] = is_nl[:, :-1]
         line_ids = starts.long().cumsum(dim=1) - 1
-
-        # pos_in_line via cummax trick on line-start global positions
         gpos = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
         marker = torch.where(starts, gpos, torch.zeros_like(gpos))
         line_start, _ = marker.cummax(dim=1)
@@ -339,10 +400,8 @@ class ModelJ(nn.Module):
         # RoPE with per-line position reset
         rope = pos_in_line.unsqueeze(-1) * self.base_freq  # (B, T, C//2)
 
-        # Content-based line angle offset:
-        # 1. Rotate each embedding by its RoPE angle (the "operator")
+        # Content-based line angle offset (full-line mean)
         rotated = apply_rotation(x, rope)  # (B, T, C)
-        # 2. Scatter-add rotated embeddings per line, then mean-pool
         n_lines = line_ids.max().item() + 1
         lid_exp = line_ids.unsqueeze(-1).expand(-1, -1, self.n_embed)
         sums = torch.zeros(B, n_lines, self.n_embed, device=device)
@@ -351,17 +410,12 @@ class ModelJ(nn.Module):
         counts.scatter_add_(1, line_ids.unsqueeze(-1),
                             torch.ones(B, T, 1, device=device))
         pooled = sums / counts.clamp(min=1)  # (B, n_lines, C)
-        # 3. Project to angle space
         line_angles = self.line_proj(self.line_ln(pooled))  # (B, n_lines, C//2)
         offset = line_angles.gather(
             1, line_ids.unsqueeze(-1).expand(-1, -1, self.n_embed // 2))
-        # 4. Zero out offset for the current (last) line — it's incomplete
-        max_line = line_ids.max(dim=1, keepdim=True).values  # (B, 1)
-        offset = offset * (line_ids != max_line).unsqueeze(-1).float()
 
-        angles = rope + offset
         for block in self.blocks:
-            x = block(x, angles)
+            x = block(x, rope, offset, line_ids)
         logits = self.lm_head(self.ln_f(x))
         loss = None
         if targets is not None:
@@ -435,7 +489,8 @@ class ModelJr(nn.Module):
 
 class ModelJc(nn.Module):
     """Like ModelJ but recomputes line offset at each layer from the
-    contextualized residual stream. Shared line_ln + line_proj across layers."""
+    contextualized residual stream. Shared line_ln + line_proj across layers.
+    Uses AddressedAttention for causal content addressing."""
 
     def __init__(self, vocab_size, n_embed, n_layers, n_heads, newline_id,
                  dropout=0.1):
@@ -447,7 +502,7 @@ class ModelJc(nn.Module):
         self.line_ln = nn.LayerNorm(n_embed)
         self.line_proj = nn.Linear(n_embed, n_embed // 2)
         self.blocks = nn.ModuleList(
-            [Block(n_embed, n_heads, dropout) for _ in range(n_layers)])
+            [AddressedBlock(n_embed, n_heads, dropout) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
@@ -465,8 +520,8 @@ class ModelJc(nn.Module):
         pos_in_line = (gpos - line_start).float()
         return line_ids, pos_in_line
 
-    def _line_offset(self, x, rope, line_ids, lid_exp, lid_exp_half,
-                     counts, current_mask):
+    def _compute_offset(self, x, rope, line_ids, lid_exp, lid_exp_half, counts):
+        """Compute per-position line offset from current residual stream."""
         rotated = apply_rotation(x, rope)
         B = x.shape[0]
         n_lines = counts.shape[1]
@@ -474,8 +529,7 @@ class ModelJc(nn.Module):
         sums.scatter_add_(1, lid_exp, rotated)
         pooled = sums / counts
         line_angles = self.line_proj(self.line_ln(pooled))
-        offset = line_angles.gather(1, lid_exp_half)
-        return offset * current_mask
+        return line_angles.gather(1, lid_exp_half)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -492,14 +546,11 @@ class ModelJc(nn.Module):
         counts.scatter_add_(1, line_ids.unsqueeze(-1),
                             torch.ones(B, T, 1, device=device))
         counts = counts.clamp(min=1)
-        max_line = line_ids.max(dim=1, keepdim=True).values
-        current_mask = (line_ids != max_line).unsqueeze(-1).float()
 
         for block in self.blocks:
-            offset = self._line_offset(x, rope, line_ids, lid_exp,
-                                       lid_exp_half, counts, current_mask)
-            angles = rope + offset
-            x = block(x, angles)
+            offset = self._compute_offset(x, rope, line_ids, lid_exp,
+                                          lid_exp_half, counts)
+            x = block(x, rope, offset, line_ids)
 
         logits = self.lm_head(self.ln_f(x))
         loss = None
@@ -563,6 +614,34 @@ def eval_ppl(model, data, block_size, batch_size, device, n_batches=50):
     return math.exp(total_loss / n) if n > 0 else float('inf')
 
 
+@torch.no_grad()
+def eval_ppl_final_line(model, data, block_size, batch_size, device,
+                        newline_id, n_batches=50):
+    """Evaluate PPL only on tokens in the final line of each chunk.
+    These tokens are leak-free: their own line's offset is never used
+    in cross-line attention, and all past lines are genuinely complete."""
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    for _ in range(n_batches):
+        x, y = get_batch(data, batch_size, block_size, device)
+        logits, _ = model(x)
+        B, T = x.shape
+        is_nl = (x == newline_id)
+        starts = torch.zeros(B, T, dtype=torch.bool, device=device)
+        starts[:, 0] = True
+        starts[:, 1:] = is_nl[:, :-1]
+        line_ids = starts.long().cumsum(dim=1) - 1
+        max_line = line_ids.max(dim=1, keepdim=True).values
+        final_mask = (line_ids == max_line)
+        loss_all = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), y.view(-1), reduction='none')
+        total_loss += (loss_all.view(B, T) * final_mask.float()).sum().item()
+        total_tokens += final_mask.sum().item()
+    model.train()
+    return math.exp(total_loss / max(total_tokens, 1))
+
+
 def train_model(model, train_data, val_data, args, name):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.iters)
@@ -592,7 +671,24 @@ def eval_lengths(model, val_data, lengths, device, batch_size, n_batches):
         if len(val_data) <= L + 1:
             results[L] = float('inf')
             continue
-        ppl = eval_ppl(model, val_data, L, batch_size, device, n_batches)
+        # Scale batch for long contexts (manual attention is O(T²) memory)
+        bs = max(1, min(batch_size, batch_size * 512 // L))
+        ppl = eval_ppl(model, val_data, L, bs, device, n_batches)
+        results[L] = ppl
+    return results
+
+
+def eval_lengths_final_line(model, val_data, lengths, device, batch_size,
+                            n_batches, newline_id):
+    """Evaluate final-line-only PPL at multiple context lengths."""
+    results = {}
+    for L in lengths:
+        if len(val_data) <= L + 1:
+            results[L] = float('inf')
+            continue
+        bs = max(1, min(batch_size, batch_size * 512 // L))
+        ppl = eval_ppl_final_line(model, val_data, L, bs, device,
+                                  newline_id, n_batches)
         results[L] = ppl
     return results
 
@@ -692,6 +788,14 @@ def main():
                            args.eval_batch_size, args.eval_batches)
         for L in sorted(res):
             print(f"  ctx={L:5d}  PPL={res[L]:.2f}")
+        print()
+
+        print("Eval PPL (final-line only) by context length:")
+        res_fl = eval_lengths_final_line(model, val_data, args.eval_lengths,
+                                         args.device, args.eval_batch_size,
+                                         args.eval_batches, newline_id)
+        for L in sorted(res_fl):
+            print(f"  ctx={L:5d}  PPL={res_fl[L]:.2f}")
         print()
         all_results[name] = res
 
